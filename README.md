@@ -1,17 +1,37 @@
 # Dell Fan Control Linux
 
-Fan control GUI and headless daemon for **Dell Latitude laptops** (tested on Latitude 7490) running Linux — specifically Fedora 44 with a 7.x kernel, but should work on any modern distro with the `dell-smm-hwmon` kernel module.
+Fan control GUI and headless daemon for **Dell Latitude laptops** on Linux (Fedora 44, kernel 7.x).
+
+Uses the **hwmon sysfs interface** (`/sys/class/hwmon/`) exclusively — no i8k, no i8kutils, no `/proc/i8k`. Those are defunct. The `dell-smm-hwmon` kernel module is still used, but only for its modern hwmon interface.
+
+---
+
+## How it works
+
+The `dell-smm-hwmon` kernel module exposes fan and temperature sensors via the standard Linux hwmon sysfs tree:
+
+```
+/sys/class/hwmon/hwmonX/
+  name          → "dell_smm" (or "coretemp", "acpitz", etc.)
+  temp*_input   → temperature in millidegrees C (read)
+  temp*_label   → sensor name (read)
+  fan*_input    → fan speed in RPM (read)
+  pwm*          → fan PWM 0–255 (write to control)
+  pwm*_enable   → 1 = manual control, 2 = auto/BIOS
+```
+
+The app reads all hwmon nodes for temperatures and fan RPMs, and writes to `pwm*` files for fan control. No proprietary interfaces, no deprecated utilities.
 
 ---
 
 ## Features
 
-- **Live temperature display** — reads from all hwmon sensors (coretemp, ACPI, Dell SMM)
-- **Live fan RPM + level display** — Fan 0 and Fan 1 via `/proc/i8k`
-- **Auto mode** — configurable temperature curve; each step maps a °C threshold to Off / Low / High; steps are editable, addable, and removable in the UI; settings persist across sessions
-- **Manual mode** — set each fan independently, apply instantly
-- **Headless / service mode** — runs without a display, ideal for boot-time auto-control via systemd
-- Supports both `i8kctl` (i8kutils) and hwmon sysfs fan control backends
+- **Live temperature display** — reads from all hwmon sensors, prioritizes CPU core/package temps
+- **Live fan RPM display** — reads `fan*_input` from all hwmon nodes
+- **Auto mode** — configurable temperature curve; applies every 2 seconds; persists to `~/.config/dell-fan-control.json`
+- **Manual mode** — set each controllable fan to Off / Low / High and apply
+- **`--probe` mode** — dumps all hwmon nodes and their values; use this to diagnose your specific hardware
+- **`--headless` mode** — no display needed; designed for systemd service
 
 ---
 
@@ -19,151 +39,130 @@ Fan control GUI and headless daemon for **Dell Latitude laptops** (tested on Lat
 
 | Requirement | Notes |
 |---|---|
-| Python 3 | Usually pre-installed |
-| `python3-tkinter` | GUI toolkit |
-| `dell-smm-hwmon` kernel module | Built-in on most distros; loaded with `force=1 ignore_dmi=1` |
-| `lm_sensors` | For full sensor enumeration |
-| `i8kutils` *(optional)* | Provides `i8kctl`; falls back to hwmon sysfs if absent |
+| Python 3 | Pre-installed on Fedora |
+| `python3-tkinter` | `sudo dnf install python3-tkinter` |
+| `lm_sensors` | `sudo dnf install lm_sensors` |
+| `dell-smm-hwmon` kernel module | Built into Fedora kernels; loaded by setup script |
 
 ---
 
 ## Quick Start
 
-### 1. Clone the repo
+### 1. Clone
 
 ```bash
 git clone https://github.com/joc00p/dell-fan-control-linux.git
 cd dell-fan-control-linux
 ```
 
-### 2. Run the setup script (once, as root)
+### 2. Setup (once, as root)
 
 ```bash
 sudo bash setup-fan-control.sh
 ```
 
-This will:
-1. Install `lm_sensors`, `python3-tkinter`, and `i8kutils` (if available in your repos)
-2. Load `dell-smm-hwmon` with `force=1 ignore_dmi=1`
-3. Persist module options in `/etc/modprobe.d/` (survives reboots)
-4. Add udev rules so the `wheel` group can access fan files
-5. Install a systemd service for headless auto-control on boot
+This loads `dell-smm-hwmon`, persists it across reboots, sets up a udev rule for `wheel` group access to fan files, installs the systemd service, and runs `--probe` so you can see exactly what your hardware exposes.
 
-### 3. Launch the GUI
+### 3. Run
 
 ```bash
 sudo python3 dell-fan-control.py
 ```
 
-> **Why sudo?** Writing to fan PWM files requires root. The udev rule installed by the setup script eventually makes this unnecessary for `wheel` group members after a reboot.
-
 ---
 
-## GUI Overview
+## Diagnosing your hardware
 
-```
-┌─────────────────────────────────────┐
-│      Dell Latitude Fan Control      │
-├─────────────────────────────────────┤
-│ Temperatures                        │
-│   CPU (i8k SMM):    52.0 °C         │
-│   Package id 0:     54.0 °C         │
-│   Core 0:           51.0 °C         │
-├─────────────────────────────────────┤
-│ Fan Status                          │
-│   Fan 0:  Low  (2400 RPM)           │
-│   Fan 1:  Low  (2200 RPM)           │
-├─────────────────────────────────────┤
-│ Control Mode  ● Auto   ○ Manual     │
-├─────────────────────────────────────┤
-│ Temperature Curve                   │
-│  From  40°C → ○ Off ● Low ○ High    │
-│    At  65°C → ○ Off ○ Low ● High    │
-│  [ + Add Step ]                     │
-└─────────────────────────────────────┘
-```
-
-### Auto Mode
-
-Each row in the curve sets a temperature threshold and the fan level to apply at or above it. Below the first threshold, the first entry's level is used. The curve is applied every 2 seconds and settings are saved to `~/.config/dell-fan-control.json`.
-
-### Manual Mode
-
-Select Off / Low / High for each fan independently, then press **Apply**.
-
----
-
-## Headless / Systemd Service
-
-The setup script installs a systemd unit at `/etc/systemd/system/dell-fan-control.service`. It runs the app in `--headless` mode (no display needed) and applies the same temperature curve saved by the GUI.
-
-**Enable and start on boot:**
+Before the GUI is useful, check what your machine actually exposes:
 
 ```bash
-sudo systemctl enable --now dell-fan-control
+sudo python3 dell-fan-control.py --probe
 ```
 
-**Monitor logs:**
+Share the output if fan control isn't working — it shows every hwmon node, every sensor file, and every value. That's the ground truth for what the kernel driver exposes on your specific hardware.
+
+You can also check manually:
 
 ```bash
-journalctl -fu dell-fan-control
-```
-
-**Stop and disable:**
-
-```bash
-sudo systemctl disable --now dell-fan-control
-```
-
-On SIGTERM the service safely sets both fans to High before exiting, handing control back to the BIOS.
-
----
-
-## How It Works
-
-The Dell Latitude 7490 exposes fan control through the **System Management Mode (SMM) BIOS interface**. The Linux kernel driver `dell-smm-hwmon` (formerly `i8k`) wraps this interface and exposes:
-
-- `/proc/i8k` — readable file with CPU temp, fan levels, and fan RPMs
-- `/sys/class/hwmon/hwmonX/` — standard hwmon sysfs for temperatures and PWM fan control
-
-Because the 7490 is not on the driver's official DMI allowlist, the module must be loaded with `force=1 ignore_dmi=1`. The setup script handles this automatically and makes it persistent.
-
-### Fan control priority
-
-1. `i8kctl fan <num> <level>` — uses ioctl on `/dev/i8k` (cleanest interface, requires `i8kutils`)
-2. hwmon sysfs `pwmN` write — direct kernel interface (fallback if i8kutils not installed)
-
----
-
-## Troubleshooting
-
-**`/proc/i8k` not found after setup**
-
-```bash
-# Check kernel module
+# What modules are loaded
 lsmod | grep dell
-dmesg | grep -i 'dell\|i8k\|smm'
 
-# Try loading manually
-sudo modprobe dell-smm-hwmon force=1 ignore_dmi=1
-```
+# What hwmon nodes exist
+ls /sys/class/hwmon/
+cat /sys/class/hwmon/hwmon*/name
 
-**No temperatures shown**
+# Does fan PWM control exist?
+ls /sys/class/hwmon/hwmon*/pwm* 2>/dev/null || echo "No PWM files found"
 
-```bash
-# Run sensor detection
-sudo sensors-detect   # answer yes to all
+# What do the sensors show?
 sensors
 ```
 
-**Fan writes silently fail**
+---
 
-The BIOS may be overriding manual fan control. Some Dell systems require `dell-bios-fan-control 0` to disable BIOS auto-management. This utility is not packaged for Fedora but can be compiled from source: [https://github.com/TomFreudenberg/dell-bios-fan-control](https://github.com/TomFreudenberg/dell-bios-fan-control)
+## GUI overview
 
-**App won't start — tkinter missing**
+```
+┌──────────────────────────────────────────┐
+│           Dell Fan Control               │
+├──────────────────────────────────────────┤
+│ Temperatures                             │
+│   Package id 0          54.0 °C          │
+│   Core 0                51.0 °C          │
+│   Core 1                52.0 °C          │
+│   acpitz/temp1          48.0 °C          │
+├──────────────────────────────────────────┤
+│ Fans                                     │
+│   dell_smm/fan1: [ctrl]  2400 RPM        │
+│   dell_smm/fan2: [ctrl]  2200 RPM        │
+├──────────────────────────────────────────┤
+│ Control Mode  ● Auto   ○ Manual          │
+├──────────────────────────────────────────┤
+│ Temperature Curve                        │
+│  Below  45°C → ● Off ○ Low ○ High        │
+│     At  60°C → ○ Off ● Low ○ High        │
+│     At  75°C → ○ Off ○ Low ● High        │
+│  [ + Add Step ]                          │
+└──────────────────────────────────────────┘
+```
+
+Fans marked `[ctrl]` have writable `pwm*` files and can be controlled. Fans without it are read-only (RPM display only).
+
+### Auto mode
+
+Reads the highest CPU temp every 2 seconds and applies the first matching threshold from the curve (bottom wins). Settings save automatically.
+
+### Manual mode
+
+Applies immediately per-fan when you click Apply. Off = PWM 0, Low ≈ 35%, High = 100%.
+
+---
+
+## Headless / systemd service
+
+The setup script installs `/etc/systemd/system/dell-fan-control.service`. It runs `--headless`, applying the same curve saved by the GUI. On SIGTERM it restores BIOS auto-control before exiting.
 
 ```bash
-sudo dnf install python3-tkinter
+# Enable and start
+sudo systemctl enable --now dell-fan-control
+
+# Logs
+journalctl -fu dell-fan-control
+
+# Stop
+sudo systemctl disable --now dell-fan-control
+```
+
+---
+
+## If no fan control is found
+
+Some Dell models do not expose writable `pwm*` files through `dell-smm-hwmon`. In that case, [`nbfc-linux`](https://github.com/nbfc-linux/nbfc-linux) is the recommended alternative — it controls fans via direct EC (Embedded Controller) access and has profiles for many Dell Latitude models.
+
+```bash
+sudo dnf copr enable smoldyn80/nbfc-linux
+sudo dnf install nbfc-linux
+nbfc config --recommend
 ```
 
 ---
@@ -172,7 +171,7 @@ sudo dnf install python3-tkinter
 
 | File | Purpose |
 |---|---|
-| `dell-fan-control.py` | Main application (GUI + headless mode) |
+| `dell-fan-control.py` | Main app — GUI, headless daemon, probe mode |
 | `setup-fan-control.sh` | One-time setup script (run as root) |
 
 ---

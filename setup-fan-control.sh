@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Dell Latitude 7490 Fan Control Setup — Fedora Linux
+# Dell Latitude Fan Control Setup — Fedora Linux
+# Uses hwmon sysfs only. No i8k, no i8kutils.
 # Run once as root: sudo bash setup-fan-control.sh
 
 set -euo pipefail
@@ -12,53 +13,48 @@ err()  { echo -e "  ${RED}✗${NC}  $*"; }
 echo
 echo "══════════════════════════════════════════"
 echo "  Dell Latitude Fan Control — Fedora Setup"
+echo "  (hwmon sysfs — no i8k/i8kutils)"
 echo "══════════════════════════════════════════"
 echo
 
-# ── 0. Root check ───────────────────────────────────────────
-if [[ $EUID -ne 0 ]]; then
-    err "Must run as root.  Try:  sudo bash setup-fan-control.sh"
-    exit 1
-fi
+[[ $EUID -ne 0 ]] && { err "Must run as root: sudo bash setup-fan-control.sh"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── 1. Packages ─────────────────────────────────────────────
 echo "[1/5] Installing packages…"
-dnf install -y \
-    lm_sensors \
-    python3-tkinter \
-    i2c-tools \
-    acpid 2>/dev/null || true
+dnf install -y lm_sensors python3-tkinter 2>/dev/null
+ok "Packages installed"
 
-# i8kutils may not be in Fedora repos — try, don't fail
-dnf install -y i8kutils 2>/dev/null && ok "i8kutils installed" \
-    || warn "i8kutils not found in repos (fan control will use hwmon sysfs instead)"
-
-ok "Packages done"
-
-# ── 2. Load module now ──────────────────────────────────────
+# ── 2. Load dell-smm-hwmon ──────────────────────────────────
 echo
 echo "[2/5] Loading dell-smm-hwmon kernel module…"
 
-# Unload first if already loaded with wrong options
 modprobe -r dell-smm-hwmon 2>/dev/null || true
 sleep 0.3
 
 if modprobe dell-smm-hwmon force=1 ignore_dmi=1; then
     sleep 0.5
-    if [[ -e /proc/i8k ]]; then
-        ok "Module loaded — /proc/i8k is available"
-        echo "     i8k data: $(cat /proc/i8k)"
-    else
-        warn "Module loaded but /proc/i8k not found — hwmon sysfs will be used"
-    fi
+    ok "Module loaded"
 else
-    err "modprobe failed. Your kernel may need a rebuild with CONFIG_I8K or CONFIG_SENSORS_DELL_SMM."
-    warn "Check: lsmod | grep dell   and   dmesg | grep -i dell"
+    err "modprobe dell-smm-hwmon failed."
+    warn "Check: dmesg | grep -i dell"
+    warn "Your kernel must be built with CONFIG_SENSORS_DELL_SMM=m or =y"
 fi
 
-# ── 3. Persist module options ───────────────────────────────
+# Show what hwmon devices appeared
+echo
+echo "  hwmon devices now present:"
+for h in /sys/class/hwmon/hwmon*; do
+    name=$(cat "$h/name" 2>/dev/null || echo "?")
+    echo "    $h  [$name]"
+    # Check for fan control
+    if ls "$h"/pwm* &>/dev/null 2>&1; then
+        ok "    Fan PWM control available: $(ls $h/pwm* 2>/dev/null | tr '\n' ' ')"
+    fi
+done
+
+# ── 3. Persist module ───────────────────────────────────────
 echo
 echo "[3/5] Persisting module configuration…"
 
@@ -73,36 +69,34 @@ EOF
 ok "Created /etc/modules-load.d/dell-smm-hwmon.conf"
 ok "Created /etc/modprobe.d/dell-smm-hwmon.conf"
 
-# ── 4. udev rules for non-root access ──────────────────────
+# ── 4. udev rule for wheel group access ─────────────────────
 echo
-echo "[4/5] Setting up udev rules (wheel group access)…"
+echo "[4/5] Setting up udev rules…"
 
 cat > /etc/udev/rules.d/99-dell-fan.rules << 'EOF'
-# Dell SMM fan control — allow wheel group to read/write
-KERNEL=="i8k",    GROUP="wheel", MODE="0660"
+# Allow wheel group to read/write Dell hwmon fan control files
 SUBSYSTEM=="hwmon", ATTR{name}=="dell_smm", \
-    RUN+="/bin/sh -c 'chmod 660 %S%p/pwm* %S%p/pwm*_enable 2>/dev/null; \
-                      chgrp wheel %S%p/pwm* %S%p/pwm*_enable 2>/dev/null; true'"
+    RUN+="/bin/sh -c 'for f in %S%p/pwm* %S%p/fan*_input; do \
+        [ -e \"$f\" ] && chmod 660 \"$f\" && chgrp wheel \"$f\"; done; true'"
 EOF
 
 udevadm control --reload-rules
 udevadm trigger
 ok "udev rules installed"
 
-# ── 5. Systemd service ──────────────────────────────────────
+# ── 5. systemd service ──────────────────────────────────────
 echo
-echo "[5/5] Installing systemd service (headless/auto-control on boot)…"
-
-PYTHON_BIN="$(which python3)"
+echo "[5/5] Installing systemd service…"
+PYTHON3="$(which python3)"
 
 cat > /etc/systemd/system/dell-fan-control.service << EOF
 [Unit]
-Description=Dell Latitude Fan Control (headless)
+Description=Dell Fan Control (hwmon headless daemon)
 After=multi-user.target
 
 [Service]
 Type=simple
-ExecStart=${PYTHON_BIN} ${SCRIPT_DIR}/dell-fan-control.py --headless
+ExecStart=${PYTHON3} ${SCRIPT_DIR}/dell-fan-control.py --headless
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -113,42 +107,31 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-ok "Systemd service installed: dell-fan-control.service"
-warn "Service NOT auto-enabled — see options below"
+ok "Service installed (not yet enabled)"
+
+# ── probe ───────────────────────────────────────────────────
+echo
+echo "══ hwmon probe output ════════════════════"
+python3 "${SCRIPT_DIR}/dell-fan-control.py" --probe 2>/dev/null || true
 
 # ── Summary ─────────────────────────────────────────────────
 echo
 echo "══════════════════════════════════════════"
-echo "  Setup complete!"
+echo "  Next steps"
 echo "══════════════════════════════════════════"
-echo
-echo "  Module status:"
-if [[ -e /proc/i8k ]]; then
-    ok "/proc/i8k available"
-else
-    warn "/proc/i8k not found (reboot may be needed)"
-fi
-
-HWMON_DELL=""
-for h in /sys/class/hwmon/hwmon*; do
-    n="$h/name"
-    [[ -f "$n" ]] && grep -qi "dell\|smm" "$n" 2>/dev/null && HWMON_DELL="$h"
-done
-if [[ -n "$HWMON_DELL" ]]; then
-    ok "hwmon sysfs: $HWMON_DELL"
-else
-    warn "Dell hwmon not found"
-fi
-
 echo
 echo "  Run the GUI:"
 echo "    sudo python3 ${SCRIPT_DIR}/dell-fan-control.py"
 echo
-echo "  Or enable headless auto-control on boot:"
-echo "    sudo systemctl enable --now dell-fan-control"
+echo "  See what hwmon exposes (share this output if things don't work):"
+echo "    sudo python3 ${SCRIPT_DIR}/dell-fan-control.py --probe"
 echo
-echo "  Monitor service logs:"
+echo "  Enable headless auto-control on boot:"
+echo "    sudo systemctl enable --now dell-fan-control"
 echo "    journalctl -fu dell-fan-control"
 echo
-echo "  Tip: run 'sensors-detect' (answer yes) to discover all temp sensors."
+echo "  If no PWM fan control is found, consider nbfc-linux as an alternative:"
+echo "    https://github.com/nbfc-linux/nbfc-linux"
+echo "    sudo dnf copr enable smoldyn80/nbfc-linux"
+echo "    sudo dnf install nbfc-linux"
 echo
